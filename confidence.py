@@ -1,9 +1,7 @@
-from collections.abc import Mapping
 from enum import IntEnum
 from functools import partial
 from itertools import chain, product
 from os import environ, path
-import re
 
 import yaml
 
@@ -39,7 +37,7 @@ def _merge(left, right, path=None, conflict=_Conflict.error):
 
     for key in right:
         if key in left:
-            if isinstance(left[key], Mapping) and isinstance(right[key], Mapping):
+            if isinstance(left[key], dict) and isinstance(right[key], dict):
                 # recurse, merge left and right dict values, update path for current 'step'
                 _merge(left[key], right[key], path + [key], conflict=conflict)
             elif left[key] != right[key]:
@@ -69,20 +67,20 @@ def _split_keys(mapping, separator='.'):
         mappings
     """
     result = {}
+    if 'items' in dir(mapping):
+        for key, value in mapping.items():
+            if isinstance(value, dict):
+                # recursively split key(s) in value
+                value = _split_keys(value, separator)
 
-    for key, value in mapping.items():
-        if isinstance(value, Mapping):
-            # recursively split key(s) in value
-            value = _split_keys(value, separator)
+            if separator in key:
+                # update key to be the first part before the separator
+                key, rest = key.split(separator, 1)
+                # use rest as the new key of value, recursively split that and update value
+                value = _split_keys({rest: value}, separator)
 
-        if separator in key:
-            # update key to be the first part before the separator
-            key, rest = key.split(separator, 1)
-            # use rest as the new key of value, recursively split that and update value
-            value = _split_keys({rest: value}, separator)
-
-        # merge the result so far with the (possibly updated / fixed / split) current key and value
-        _merge(result, {key: value})
+            # merge the result so far with the (possibly updated / fixed / split) current key and value
+            _merge(result, {key: value})
 
     return result
 
@@ -98,13 +96,13 @@ class _NoDefault:
 _NoDefault = _NoDefault()
 
 
-class Configuration(Mapping):
+class Configuration(dict):
     """
     A collection of configured values, retrievable as either `dict`-like items
     or attributes.
     """
 
-    def __init__(self, *sources, separator='.'):
+    def __init__(self, sources, separator='.'):
         """
         Create a new `.Configuration`, based on one or multiple source mappings.
 
@@ -148,7 +146,7 @@ class Configuration(Mapping):
 
             if as_type:
                 return as_type(value)
-            elif isinstance(value, Mapping):
+            elif isinstance(value, dict):
                 namespace = Configuration()
                 namespace._source = value
                 return namespace
@@ -167,7 +165,7 @@ class Configuration(Mapping):
         unconfigured value will return `.NotConfigured`, a 'safe' sentinel
         value.
 
-        :param attr: the 'step' (key, attribute, …) to take
+        :param attr: the 'step' (key, attribute, ...) to take
         :return: a value, as either an actual value or a `.Configuration`
             instance (`.NotConfigured` in case of an unconfigured 'step')
         """
@@ -181,9 +179,6 @@ class Configuration(Mapping):
 
     def __iter__(self):
         return iter(self._source)
-
-    def __dir__(self):
-        return sorted(set(chain(super().__dir__(), self.keys())))
 
 
 class NotConfigured(Configuration):
@@ -211,10 +206,10 @@ def load(*fps):
     :return: a `.Configuration` instance providing values from *fps*
     :rtype: `.Configuration`
     """
-    return Configuration(*(yaml.load(fp.read()) for fp in fps))
+    return Configuration([yaml.load(fp.read()) for fp in fps])
 
 
-def loadf(*fnames, default=_NoDefault):
+def loadf(fnames, default=_NoDefault):
     """
     Read a `.Configuration` instance from named files.
 
@@ -233,7 +228,7 @@ def loadf(*fnames, default=_NoDefault):
         else:
             return default
 
-    return Configuration(*(readf(path.expanduser(fname)) for fname in fnames))
+    return Configuration([readf(path.expanduser(fname)) for fname in fnames])
 
 
 def loads(*strings):
@@ -244,7 +239,7 @@ def loads(*strings):
     :return: a `.Configuration` instance providing values from *strings*
     :rtype: `.Configuration`
     """
-    return Configuration(*(yaml.load(string) for string in strings))
+    return Configuration([yaml.load(string) for string in strings])
 
 
 def read_xdg_config_dirs(name, extension):
@@ -269,7 +264,7 @@ def read_xdg_config_dirs(name, extension):
 
     # load a file from all config dirs, default to NotConfigured
     fname = '{name}.{extension}'.format(name=name, extension=extension)
-    return loadf(*(path.join(config_dir, fname) for config_dir in config_dirs),
+    return loadf([path.join(config_dir, fname) for config_dir in config_dirs],
                  default=NotConfigured)
 
 
@@ -291,17 +286,14 @@ def read_xdg_config_home(name, extension):
         config_home = path.expanduser('~/.config')
 
     # expand to full path to configuration file in XDG config path
-    return loadf(path.join(config_home, '{name}.{extension}'.format(name=name, extension=extension)),
-                 default=NotConfigured)
+    return loadf([path.join(config_home, '{name}.{extension}'.format(name=name, extension=extension))],
+                  default=NotConfigured)
 
 
 def read_envvars(name, extension):
     """
     Read environment variables starting with ``NAME_``, where subsequent
-    underscores are interpreted as namespaces. Underscores can be retained as
-    namespaces by doubling them up, e.g. ``NAME_SPA__CE_KEY`` would be
-    accessible in the resulting `.Configuration` as
-    ``c.spa_ce.key``, where ``c`` is the `.Configuration` instance.
+    underscores are interpreted as namespaces.
 
     .. note::
 
@@ -325,13 +317,8 @@ def read_envvars(name, extension):
     if not values:
         return NotConfigured
 
-    def dotted(name):
-        # replace 'regular' underscores (those between alphanumeric characters) with dots first
-        name = re.sub(r'([0-9A-Za-z])_([0-9A-Za-z])', r'\1.\2', name)
-        # unescape double underscores back to a single one
-        return re.sub(r'__', '_', name)
-
-    return Configuration({dotted(name): value for name, value in values.items()})
+    # treat _'s as separators, FOO_NS_KEY=bar resulting in {'ns': {'key': 'bar'}}
+    return Configuration(values, separator='_')
 
 
 def read_envvar_file(name, extension):
@@ -347,7 +334,7 @@ def read_envvar_file(name, extension):
     envvar_file = environ.get('{}_config_file'.format(name).upper())
     if envvar_file:
         # envvar set, load value as file
-        return loadf(envvar_file)
+        return loadf([envvar_file])
     else:
         # envvar not set, return an empty source
         return NotConfigured
@@ -372,7 +359,7 @@ def read_envvar_dir(envvar, name, extension):
 
     # envvar is set, construct full file path, expanding user to allow the envvar containing a value like ~/config
     config_path = path.join(path.expanduser(config_dir), '{name}.{extension}'.format(name=name, extension=extension))
-    return loadf(config_path, default=NotConfigured)
+    return loadf([config_path], default=NotConfigured)
 
 
 # ordered sequence of name templates to load, in increasing significance
@@ -397,7 +384,7 @@ LOAD_ORDER = (
 )
 
 
-def load_name(*names, load_order=LOAD_ORDER, extension='yaml'):
+def load_name(names, load_order=LOAD_ORDER, extension='yaml'):
     """
     Read a `.Configuration` instance by name, trying to read from files in
     increasing significance. System-wide configuration locations are preceded
@@ -420,6 +407,6 @@ def load_name(*names, load_order=LOAD_ORDER, extension='yaml'):
             else:
                 # expand user to turn ~/.name.yaml into /home/user/.name.yaml
                 candidate = path.expanduser(source.format(name=name, extension=extension))
-                yield loadf(candidate, default=NotConfigured)
+                yield loadf([candidate], default=NotConfigured)
 
-    return Configuration(*generate_sources())
+    return Configuration([generate_sources()])
